@@ -4,15 +4,21 @@
 
 * Enhancements
   * Add SCRAM-SHA-256-PLUS support
+  * Use reports for logging errors
+  * Support arrays of domains defined over arrays
 
 * Bug fixes
+  * Do not UNLISTEN while disconnected
   * Do not set `num_rows` to non-nil atom
-  * Use reports for logging errors
   * Fix composite type loading when `record_send` is duplicated
-  * Fix encoding of domains over composite types
+  * Fix async messages during replication startup
   * Enforce integer bounds in type encoders
-  * Decode the `void` type on CockroachDB (`voidsend`/`voidout`)
-  * Decode the `inet`, `pg_lsn`, and `ltree` types on CockroachDB (`inetsend`/`pg_lsnsend`/`ltreesend`)
+  * Decode the `void`, `inet`, `pg_lsn`, and `ltree` types on CockroachDB (`voidsend`/`inetsend`/`pg_lsnsend`/`ltreesend`)
+
+## v0.22.4 (2026-08-07)
+
+* Security
+  * Escape comments on `Postgrex.stream/4` (CVE-2026-66838)
 
 ## v0.22.3 (2026-07-09)
 
