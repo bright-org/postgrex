@@ -341,6 +341,10 @@ defmodule Postgrex.Protocol do
     sync_error(s, :transaction)
   end
 
+  def checkout(%{buffer: buffer} = s) when is_binary(buffer) do
+    {:ok, s}
+  end
+
   def checkout(%{buffer: :active_once} = s) do
     case setopts(s, [active: false], :active_once) do
       :ok -> recv_buffer(s)
@@ -747,22 +751,10 @@ defmodule Postgrex.Protocol do
 
   ## connect
 
-  defp connect(host, port, sock_opts, timeout, s) do
-    buffer? = Keyword.has_key?(sock_opts, :buffer)
-
-    case :gen_tcp.connect(host, port, sock_opts ++ @sock_opts, timeout) do
-      {:ok, sock} when buffer? ->
-        {:ok, %{s | sock: {:gen_tcp, sock}}}
-
+  defp connect(host, port, _sock_opts, timeout, s) do
+    case Postgrex.Socket.connect(host, port, timeout) do
       {:ok, sock} ->
-        # A suitable :buffer is only set if :recbuf is included in
-        # :socket_options.
-        {:ok, [sndbuf: sndbuf, recbuf: recbuf, buffer: buffer]} =
-          :inet.getopts(sock, [:sndbuf, :recbuf, :buffer])
-
-        buffer = buffer |> max(sndbuf) |> max(recbuf)
-        :ok = :inet.setopts(sock, buffer: buffer)
-        {:ok, %{s | sock: {:gen_tcp, sock}}}
+        {:ok, %{s | sock: {Postgrex.Socket, sock}}}
 
       {:error, reason} ->
         case host do
@@ -777,8 +769,8 @@ defmodule Postgrex.Protocol do
 
   ## handshake
 
-  defp handshake(host, %{sock: {:gen_tcp, sock}, timeout: timeout} = s, status) do
-    {:ok, peer} = :inet.peername(sock)
+  defp handshake(host, %{sock: {mod, sock}, timeout: timeout} = s, status) do
+    {:ok, peer} = sock_peername(mod, sock)
     %{opts: opts} = status
     handshake_timeout = Keyword.get(opts, :handshake_timeout, timeout)
     timer = start_handshake_timer(handshake_timeout, sock)
@@ -816,7 +808,7 @@ defmodule Postgrex.Protocol do
         report_cb: &__MODULE__._format_handshake_shutdown/1
       )
 
-      :gen_tcp.shutdown(sock, :read_write)
+      Postgrex.Socket.shutdown(sock, :read_write)
     end
   end
 
@@ -3269,6 +3261,7 @@ defmodule Postgrex.Protocol do
   end
 
   defp tag(:gen_tcp), do: :tcp
+  defp tag(Postgrex.Socket), do: :tcp
   defp tag(:ssl), do: :ssl
 
   defp decode_tags([tag]), do: decode_tag(tag)
@@ -3501,7 +3494,13 @@ defmodule Postgrex.Protocol do
   end
 
   defp conn_error(:tcp, action, reason) do
-    formatted_reason = :inet.format_error(reason)
+    formatted_reason =
+      if function_exported?(:inet, :format_error, 1) do
+        :inet.format_error(reason)
+      else
+        inspect(reason)
+      end
+
     conn_error("tcp #{action}: #{formatted_reason} - #{inspect(reason)}")
   end
 
@@ -3576,6 +3575,10 @@ defmodule Postgrex.Protocol do
     {:disconnect, err, s}
   end
 
+  defp recv_buffer(%{sock: {Postgrex.Socket, _sock}} = s) do
+    {:ok, %{s | buffer: <<>>}}
+  end
+
   defp recv_buffer(%{sock: {:gen_tcp, sock}} = s) do
     receive do
       {:tcp, ^sock, buffer} ->
@@ -3608,6 +3611,14 @@ defmodule Postgrex.Protocol do
     end
   end
 
+  defp sock_peername(Postgrex.Socket, sock), do: Postgrex.Socket.peername(sock)
+  defp sock_peername(:gen_tcp, sock), do: :inet.peername(sock)
+  defp sock_peername(:ssl, sock), do: :ssl.peername(sock)
+
+  defp activate(%{sock: {Postgrex.Socket, _}} = s, buffer) when is_binary(buffer) do
+    {:ok, %{s | buffer: buffer}}
+  end
+
   ## Fake [active: once] if buffer not empty
   defp activate(s, <<>>) do
     case setopts(s, [active: :once], <<>>) do
@@ -3631,6 +3642,7 @@ defmodule Postgrex.Protocol do
     end
   end
 
+  defp setopts(Postgrex.Socket, _sock, _opts), do: :ok
   defp setopts(:gen_tcp, sock, opts), do: :inet.setopts(sock, opts)
   defp setopts(:ssl, sock, opts), do: :ssl.setopts(sock, opts)
 
@@ -3644,7 +3656,7 @@ defmodule Postgrex.Protocol do
   defp cancel_request(%{peer: {ip, port}} = s), do: cancel_request(ip, port, s)
 
   defp cancel_request(ip, port, %{timeout: timeout} = s) do
-    case :gen_tcp.connect(ip, port, [mode: :binary, active: false], timeout) do
+    case Postgrex.Socket.connect(ip, port, timeout) do
       {:ok, sock} -> cancel_send_recv(s, sock)
       {:error, reason} -> {:error, :connect, reason}
     end
@@ -3653,7 +3665,7 @@ defmodule Postgrex.Protocol do
   defp cancel_send_recv(%{connection_id: pid, connection_key: key} = s, sock) do
     msg = msg_cancel_request(pid: pid, key: key)
 
-    case :gen_tcp.send(sock, encode_msg(msg)) do
+    case Postgrex.Socket.send(sock, encode_msg(msg)) do
       :ok -> cancel_recv(s, sock)
       {:error, reason} -> {:error, :send, reason}
     end
@@ -3661,8 +3673,8 @@ defmodule Postgrex.Protocol do
 
   defp cancel_recv(%{timeout: timeout}, sock) do
     # ignore result as socket will close, else can do nothing
-    _ = :gen_tcp.recv(sock, 0, timeout)
-    :gen_tcp.close(sock)
+    _ = Postgrex.Socket.recv(sock, 0, timeout)
+    Postgrex.Socket.close(sock)
   end
 
   defp sock_close(%{sock: {mod, sock}}), do: mod.close(sock)
