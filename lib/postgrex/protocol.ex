@@ -713,18 +713,6 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  defp handle_socket({:tcp, sock, data}, %{sock: {:gen_tcp, sock}}) do
-    {:data, data}
-  end
-
-  defp handle_socket({:tcp_closed, sock}, %{sock: {:gen_tcp, sock}} = s) do
-    disconnect(s, :tcp, "async recv", :closed)
-  end
-
-  defp handle_socket({:tcp_error, sock, reason}, %{sock: {:gen_tcp, sock}} = s) do
-    disconnect(s, :tcp, "async recv", reason)
-  end
-
   defp handle_socket({:ssl, sock, data}, %{sock: {:ssl, sock}}) do
     {:data, data}
   end
@@ -845,8 +833,8 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  defp ssl_recv(%{sock: {:gen_tcp, sock}} = s, status, ssl_opts) do
-    case :gen_tcp.recv(sock, 1, :infinity) do
+  defp ssl_recv(%{sock: {Postgrex.Socket, sock}} = s, status, ssl_opts) do
+    case Postgrex.Socket.recv(sock, 1, :infinity) do
       {:ok, <<?S>>} ->
         ssl_connect(s, status, ssl_opts)
 
@@ -870,14 +858,10 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  defp ssl_connect(%{sock: {:gen_tcp, sock}, timeout: timeout} = s, status, ssl_opts) do
-    case :ssl.connect(sock, ssl_opts, timeout) do
-      {:ok, ssl_sock} ->
-        startup(%{s | sock: {:ssl, ssl_sock}}, status)
-
-      {:error, reason} ->
-        disconnect(s, :ssl, "connect", reason)
-    end
+  # OTP :ssl.connect/3 upgrades an existing TCP socket. AtomVM's :ssl.connect/3
+  # opens a new connection instead, so the Postgrex SSL path cannot run as-is.
+  defp ssl_connect(%{sock: {Postgrex.Socket, _sock}} = s, _status, _ssl_opts) do
+    disconnect(s, %Postgrex.Error{message: "ssl is not supported"}, "")
   end
 
   ## startup
@@ -3260,7 +3244,6 @@ defmodule Postgrex.Protocol do
     Enum.map(fields, fn row_field(name: name) -> name end)
   end
 
-  defp tag(:gen_tcp), do: :tcp
   defp tag(Postgrex.Socket), do: :tcp
   defp tag(:ssl), do: :ssl
 
@@ -3311,22 +3294,6 @@ defmodule Postgrex.Protocol do
 
   # It is ok to use infinity timeout here if in client process as timer is
   # running.
-  defp msg_recv(%{sock: {:gen_tcp, sock}} = s, timeout, :active_once) do
-    receive do
-      {:tcp, ^sock, buffer} ->
-        msg_recv(s, timeout, buffer)
-
-      {:tcp_closed, ^sock} ->
-        disconnect(s, :tcp, "async_recv", :closed, :active_once)
-
-      {:tcp_error, ^sock, reason} ->
-        disconnect(s, :tcp, "async_recv", reason, :active_once)
-    after
-      timeout ->
-        disconnect(s, :tcp, "async_recv", :timeout, :active_once)
-    end
-  end
-
   defp msg_recv(%{sock: {:ssl, sock}} = s, timeout, :active_once) do
     receive do
       {:ssl, ^sock, buffer} ->
@@ -3579,22 +3546,6 @@ defmodule Postgrex.Protocol do
     {:ok, %{s | buffer: <<>>}}
   end
 
-  defp recv_buffer(%{sock: {:gen_tcp, sock}} = s) do
-    receive do
-      {:tcp, ^sock, buffer} ->
-        {:ok, %{s | buffer: buffer}}
-
-      {:tcp_closed, ^sock} ->
-        disconnect(s, :tcp, "async recv", :closed, "")
-
-      {:tcp_error, ^sock, reason} ->
-        disconnect(s, :tcp, "async_recv", reason, "")
-    after
-      0 ->
-        {:ok, %{s | buffer: <<>>}}
-    end
-  end
-
   defp recv_buffer(%{sock: {:ssl, sock}} = s) do
     receive do
       {:ssl, ^sock, buffer} ->
@@ -3612,7 +3563,6 @@ defmodule Postgrex.Protocol do
   end
 
   defp sock_peername(Postgrex.Socket, sock), do: Postgrex.Socket.peername(sock)
-  defp sock_peername(:gen_tcp, sock), do: :inet.peername(sock)
   defp sock_peername(:ssl, sock), do: :ssl.peername(sock)
 
   defp activate(%{sock: {Postgrex.Socket, _}} = s, buffer) when is_binary(buffer) do
@@ -3643,7 +3593,6 @@ defmodule Postgrex.Protocol do
   end
 
   defp setopts(Postgrex.Socket, _sock, _opts), do: :ok
-  defp setopts(:gen_tcp, sock, opts), do: :inet.setopts(sock, opts)
   defp setopts(:ssl, sock, opts), do: :ssl.setopts(sock, opts)
 
   defp terminate(%{sock: {mod, sock}}) do
