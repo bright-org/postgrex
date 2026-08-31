@@ -100,8 +100,10 @@ defmodule Postgrex.Utils do
     |> then(fn opts ->
       if has_endpoint?, do: opts, else: Keyword.put(opts, field, value)
     end)
-    |> Keyword.put_new(:port, System.get_env("PGPORT"))
-    |> Keyword.update!(:port, &normalize_port/1)
+    |> then(fn opts ->
+      port = normalize_port(Keyword.get(opts, :port) || System.get_env("PGPORT") || 5432)
+      Keyword.put(opts, :port, port)
+    end)
     |> Keyword.put_new(:types, Postgrex.DefaultTypes)
     |> Enum.reject(fn {_k, v} -> is_nil(v) end)
   end
