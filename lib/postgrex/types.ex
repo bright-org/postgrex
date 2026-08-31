@@ -43,19 +43,32 @@ defmodule Postgrex.Types do
   @doc false
   @spec owner(state) :: {:ok, pid} | :error
   def owner({_, table}) do
-    case :ets.info(table, :owner) do
-      owner when is_pid(owner) ->
-        {:ok, owner}
+    # Avoid a static :ets.info/2 import — AtomVM lacks it and unresolved
+    # imports make the calling function appear undef.
+    if apply(:erlang, :function_exported, [:ets, :info, 2]) do
+      case apply(:ets, :info, [table, :owner]) do
+        owner when is_pid(owner) ->
+          {:ok, owner}
 
-      :undefined ->
-        :error
+        :undefined ->
+          :error
+      end
+    else
+      :error
     end
   end
 
   @doc false
   @spec bootstrap_query({pos_integer, non_neg_integer, non_neg_integer}, state) :: binary | nil
   def bootstrap_query(version, %{types: {_, table}} = s) do
-    case :ets.info(table, :size) do
+    size =
+      if apply(:erlang, :function_exported, [:ets, :info, 2]) do
+        apply(:ets, :info, [table, :size])
+      else
+        0
+      end
+
+    case size do
       0 ->
         # avoid loading information about table-types
         # since there might be a lot them and most likely

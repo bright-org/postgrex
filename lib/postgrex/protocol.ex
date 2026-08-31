@@ -776,13 +776,9 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  defp start_handshake_timer(:infinity, _), do: :infinity
-
-  defp start_handshake_timer(timeout, sock) do
-    args = [timeout, self(), sock]
-    {:ok, tref} = :timer.apply_after(timeout, __MODULE__, :handshake_shutdown, args)
-    {:timer, tref}
-  end
+  # AtomVM :timer has apply_after/4 but not cancel/1. Starting a timer we
+  # cannot cancel would shut down a live connection after handshake_timeout.
+  defp start_handshake_timer(_timeout, _), do: :infinity
 
   @doc false
   def handshake_shutdown(timeout, pid, sock) do
@@ -802,10 +798,10 @@ defmodule Postgrex.Protocol do
 
   def cancel_handshake_timer(:infinity), do: :ok
 
-  def cancel_handshake_timer({:timer, tref}) do
-    {:ok, _} = :timer.cancel(tref)
-    :ok
-  end
+  # AtomVM's :timer has apply_after/4 but not cancel/1.
+  def cancel_handshake_timer({:timer, _tref}), do: :ok
+
+  def cancel_handshake_timer(_), do: :ok
 
   @doc false
   def _format_handshake_shutdown(report) do
@@ -954,7 +950,7 @@ defmodule Postgrex.Protocol do
   end
 
   defp auth_cont(s, %{opts: opts} = status, data, buffer) do
-    {client_final_msg, scram_state} = Postgrex.SCRAM.client_final(data, s.scram_cb, opts)
+    {client_final_msg, scram_state} = Postgrex.SCRAM.finish_client(data, s.scram_cb, opts)
     s = %{s | scram: scram_state}
     auth_send(s, msg_password(pass: client_final_msg), status, buffer)
   end
