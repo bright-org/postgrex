@@ -858,6 +858,7 @@ defmodule Postgrex.Protocol do
     end
   end
 
+  # TODO: SSL is not supported.
   # OTP :ssl.connect/3 upgrades an existing TCP socket. AtomVM's :ssl.connect/3
   # opens a new connection instead, so the Postgrex SSL path cannot run as-is.
   defp ssl_connect(%{sock: {Postgrex.Socket, _sock}} = s, _status, _ssl_opts) do
