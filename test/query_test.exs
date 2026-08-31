@@ -2373,13 +2373,13 @@ defmodule QueryTest do
 
   defp disconnect(pid) do
     sock = DBConnection.run(pid, &get_socket/1)
-    :gen_tcp.shutdown(sock, :read_write)
+    Postgrex.Socket.shutdown(sock, :read_write)
   end
 
   defp get_socket(conn) do
     {:pool_ref, _, _, _, holder, _} = conn.pool_ref
     [{:conn, _, _, state, _, _, _, _}] = :ets.lookup(holder, :conn)
-    {:gen_tcp, sock} = state.sock
+    {Postgrex.Socket, sock} = state.sock
     sock
   end
 end

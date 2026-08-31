@@ -49,7 +49,7 @@ defmodule Postgrex do
           | {:ping_timeout, timeout}
           | {:ssl, boolean | [:ssl.tls_client_option()]}
           | {:channel_binding, :prefer | :require | :disable}
-          | {:socket_options, [:gen_tcp.connect_option()]}
+          | {:socket_options, [term]}
           | {:prepare, :named | :unnamed}
           | {:transactions, :strict | :naive}
           | {:types, module}
