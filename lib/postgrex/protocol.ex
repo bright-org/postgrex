@@ -1786,9 +1786,10 @@ defmodule Postgrex.Protocol do
     with {:ok, result_info} <- fetch_type_info(result_oids, types) do
       {result_formats, result_types} = Enum.unzip(result_info)
 
+      # Avoid Enum.zip/2 — missing on AtomVM; unresolved MFA makes describe_result undef.
       result_types =
         result_types
-        |> Enum.zip(result_mods)
+        |> zip2(result_mods)
         |> Enum.map(fn
           {{extension, sub_oids, sub_types}, mod} -> {extension, sub_oids, sub_types, mod}
           {extension, mod} -> {extension, mod}
@@ -1807,6 +1808,9 @@ defmodule Postgrex.Protocol do
       {:ok, query}
     end
   end
+
+  defp zip2([a | as], [b | bs]), do: [{a, b} | zip2(as, bs)]
+  defp zip2(_, _), do: []
 
   defp error_flushed(s, %{mode: :transaction} = status, err, buffer) do
     with :ok <- msg_send(s, [msg_sync()], buffer) do
@@ -3232,9 +3236,22 @@ defmodule Postgrex.Protocol do
   end
 
   defp columns(fields) do
-    fields
-    |> Enum.map(fn row_field(type_oid: oid, type_mod: mod, name: name) -> {oid, name, mod} end)
-    |> :lists.unzip3()
+    # Avoid :lists.unzip3/1 — missing on AtomVM; unresolved MFA makes this
+    # function appear as undef at call sites.
+    unzip3_row_fields(fields, [], [], [])
+  end
+
+  defp unzip3_row_fields([], oids, names, mods) do
+    {:lists.reverse(oids), :lists.reverse(names), :lists.reverse(mods)}
+  end
+
+  defp unzip3_row_fields(
+         [row_field(type_oid: oid, type_mod: mod, name: name) | rest],
+         oids,
+         names,
+         mods
+       ) do
+    unzip3_row_fields(rest, [oid | oids], [name | names], [mod | mods])
   end
 
   defp column_names(fields) do

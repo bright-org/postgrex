@@ -171,7 +171,12 @@ defmodule Postgrex.Types do
   def associate_type_infos(type_infos, {module, table}) do
     _ =
       for %TypeInfo{oid: oid} = type_info <- type_infos do
-        true = :ets.insert_new(table, {oid, type_info, nil})
+        # insert_new returns false on reconnect when the oid already exists.
+        # AtomVM TypeServer may re-associate after a dropped connection.
+        case :ets.insert_new(table, {oid, type_info, nil}) do
+          true -> true
+          false -> :ets.insert(table, {oid, type_info, nil})
+        end
       end
 
     _ =
@@ -183,7 +188,13 @@ defmodule Postgrex.Types do
             :ets.delete(table, oid)
 
           info ->
-            true = :ets.update_element(table, oid, {3, info})
+            case :ets.update_element(table, oid, {3, info}) do
+              true ->
+                true
+
+              false ->
+                :ets.insert(table, {oid, type_info, info})
+            end
         end
       end
 
