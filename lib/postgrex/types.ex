@@ -42,48 +42,21 @@ defmodule Postgrex.Types do
 
   @doc false
   @spec owner(state) :: {:ok, pid} | :error
-  def owner({_, table}) do
-    # Avoid a static :ets.info/2 import — AtomVM lacks it and unresolved
-    # imports make the calling function appear undef.
-    if apply(:erlang, :function_exported, [:ets, :info, 2]) do
-      case apply(:ets, :info, [table, :owner]) do
-        owner when is_pid(owner) ->
-          {:ok, owner}
-
-        :undefined ->
-          :error
-      end
-    else
-      :error
-    end
+  def owner({_, _table}) do
+    # AtomVM has no :ets.info/2.
+    :error
   end
 
   @doc false
   @spec bootstrap_query({pos_integer, non_neg_integer, non_neg_integer}, state) :: binary | nil
-  def bootstrap_query(version, %{types: {_, table}} = s) do
-    size =
-      if apply(:erlang, :function_exported, [:ets, :info, 2]) do
-        apply(:ets, :info, [table, :size])
-      else
-        0
-      end
+  def bootstrap_query(version, s) do
+    # AtomVM has no :ets.info/2 size; always bootstrap.
+    filter_oids = """
+    WHERE (t.typrelid = 0)
+    AND (t.typelem = 0 OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type s WHERE s.typrelid != 0 AND s.oid = t.typelem))
+    """
 
-    case size do
-      0 ->
-        # avoid loading information about table-types
-        # since there might be a lot them and most likely
-        # they won't be used; subsequent bootstrap will
-        # fetch them along with any other "new" types
-        filter_oids = """
-        WHERE (t.typrelid = 0)
-        AND (t.typelem = 0 OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type s WHERE s.typrelid != 0 AND s.oid = t.typelem))
-        """
-
-        build_bootstrap_query(version, filter_oids, s)
-
-      _ ->
-        nil
-    end
+    build_bootstrap_query(version, filter_oids, s)
   end
 
   defp build_bootstrap_query(version, filter_oids, s) do
