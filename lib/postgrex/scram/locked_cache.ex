@@ -51,7 +51,7 @@ defmodule Postgrex.SCRAM.LockedCache do
     end
   end
 
-  defp init(), do: :ets.new(@name, [:public, :set, :named_table, read_concurrency: true])
+  defp init(), do: :ets.new(@name, [:public, :set, :named_table])
   defp write(key, value), do: :ets.insert(@name, {key, value})
   defp hard_read(key), do: :ets.lookup_element(@name, key, 2)
 
@@ -107,7 +107,9 @@ defmodule Postgrex.SCRAM.LockedCache do
     {:noreply, unlock(ref, state)}
   end
 
-  defp lock(key, {pid, _} = from, waiting, state) do
+  # AtomVM can fail to resolve non-exported Elixir locals (undef on defp).
+  # Keep these as def so SCRAM auth works under AtomVM's gen_server.
+  def lock(key, {pid, _} = from, waiting, state) do
     ref = Process.monitor(pid)
     state = put_in(state.keys[key], {ref, waiting})
     state = put_in(state.ref_to_key[ref], key)
@@ -115,7 +117,7 @@ defmodule Postgrex.SCRAM.LockedCache do
     state
   end
 
-  defp unlock(ref, state) do
+  def unlock(ref, state) do
     {key, state} = pop_in(state.ref_to_key[ref])
     {{^ref, waiting}, state} = pop_in(state.keys[key])
 

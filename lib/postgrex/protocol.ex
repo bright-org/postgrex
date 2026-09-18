@@ -98,15 +98,15 @@ defmodule Postgrex.Protocol do
         {true, opts} ->
           case Keyword.pop(opts, :ssl_opts) do
             {nil, opts} ->
-              {[cacerts: :public_key.cacerts_get()] ++ default_ssl_opts(), opts}
+              {default_ssl_opts(), opts}
 
             {ssl_opts, opts} ->
               Logger.warning(":ssl_opts is deprecated, pass opts to :ssl instead")
-              {ssl_opts, opts}
+              {normalize_ssl_opts(ssl_opts), opts}
           end
 
         {ssl_opts, opts} when is_list(ssl_opts) ->
-          {Keyword.merge(default_ssl_opts(), ssl_opts), opts}
+          {Keyword.merge(default_ssl_opts(), normalize_ssl_opts(ssl_opts)), opts}
       end
 
     transactions =
@@ -176,13 +176,17 @@ defmodule Postgrex.Protocol do
     connect_endpoints(endpoints, sock_opts ++ @sock_opts, connect_timeout, s, status, [])
   end
 
+  # SSL is not supported on AtomVM; opts are only built before ssl_connect fails.
+  # Avoid :public_key.cacerts_get/0 so ssl: true does not crash before that message.
   defp default_ssl_opts do
-    [
-      verify: :verify_peer,
-      customize_hostname_check: [
-        match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
-      ]
-    ]
+    [verify: :verify_none, active: false]
+  end
+
+  defp normalize_ssl_opts(ssl_opts) do
+    ssl_opts
+    |> Keyword.put(:verify, :verify_none)
+    |> Keyword.put_new(:active, false)
+    |> Keyword.drop([:customize_hostname_check, :cacerts, :cacertfile])
   end
 
   defp endpoints(opts) do
@@ -713,6 +717,18 @@ defmodule Postgrex.Protocol do
     end
   end
 
+  defp handle_socket({:tcp, sock, data}, %{sock: {Postgrex.Socket, sock}}) do
+    {:data, data}
+  end
+
+  defp handle_socket({:tcp_closed, sock}, %{sock: {Postgrex.Socket, sock}} = s) do
+    disconnect(s, :tcp, "async recv", :closed)
+  end
+
+  defp handle_socket({:tcp_error, sock, reason}, %{sock: {Postgrex.Socket, sock}} = s) do
+    disconnect(s, :tcp, "async recv", reason)
+  end
+
   defp handle_socket({:ssl, sock, data}, %{sock: {:ssl, sock}}) do
     {:data, data}
   end
@@ -739,8 +755,8 @@ defmodule Postgrex.Protocol do
 
   ## connect
 
-  defp connect(host, port, _sock_opts, timeout, s) do
-    case Postgrex.Socket.connect(host, port, timeout) do
+  defp connect(host, port, sock_opts, timeout, s) do
+    case Postgrex.Socket.connect(host, port, timeout, sock_opts) do
       {:ok, sock} ->
         {:ok, %{s | sock: {Postgrex.Socket, sock}}}
 
@@ -776,13 +792,9 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  defp start_handshake_timer(:infinity, _), do: :infinity
-
-  defp start_handshake_timer(timeout, sock) do
-    args = [timeout, self(), sock]
-    {:ok, tref} = :timer.apply_after(timeout, __MODULE__, :handshake_shutdown, args)
-    {:timer, tref}
-  end
+  # AtomVM :timer has apply_after/4 but not cancel/1. Starting a timer we
+  # cannot cancel would shut down a live connection after handshake_timeout.
+  defp start_handshake_timer(_timeout, _), do: :infinity
 
   @doc false
   def handshake_shutdown(timeout, pid, sock) do
@@ -802,10 +814,10 @@ defmodule Postgrex.Protocol do
 
   def cancel_handshake_timer(:infinity), do: :ok
 
-  def cancel_handshake_timer({:timer, tref}) do
-    {:ok, _} = :timer.cancel(tref)
-    :ok
-  end
+  # AtomVM's :timer has apply_after/4 but not cancel/1.
+  def cancel_handshake_timer({:timer, _tref}), do: :ok
+
+  def cancel_handshake_timer(_), do: :ok
 
   @doc false
   def _format_handshake_shutdown(report) do
@@ -858,9 +870,6 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  # TODO: SSL is not supported.
-  # OTP :ssl.connect/3 upgrades an existing TCP socket. AtomVM's :ssl.connect/3
-  # opens a new connection instead, so the Postgrex SSL path cannot run as-is.
   defp ssl_connect(%{sock: {Postgrex.Socket, _sock}} = s, _status, _ssl_opts) do
     disconnect(s, %Postgrex.Error{message: "ssl is not supported"}, "")
   end
@@ -954,7 +963,7 @@ defmodule Postgrex.Protocol do
   end
 
   defp auth_cont(s, %{opts: opts} = status, data, buffer) do
-    {client_final_msg, scram_state} = Postgrex.SCRAM.client_final(data, s.scram_cb, opts)
+    {client_final_msg, scram_state} = Postgrex.SCRAM.finish_client(data, s.scram_cb, opts)
     s = %{s | scram: scram_state}
     auth_send(s, msg_password(pass: client_final_msg), status, buffer)
   end
@@ -1790,9 +1799,10 @@ defmodule Postgrex.Protocol do
     with {:ok, result_info} <- fetch_type_info(result_oids, types) do
       {result_formats, result_types} = Enum.unzip(result_info)
 
+      # Avoid Enum.zip/2 — missing on AtomVM; unresolved MFA makes describe_result undef.
       result_types =
         result_types
-        |> Enum.zip(result_mods)
+        |> zip2(result_mods)
         |> Enum.map(fn
           {{extension, sub_oids, sub_types}, mod} -> {extension, sub_oids, sub_types, mod}
           {extension, mod} -> {extension, mod}
@@ -1811,6 +1821,9 @@ defmodule Postgrex.Protocol do
       {:ok, query}
     end
   end
+
+  defp zip2([a | as], [b | bs]), do: [{a, b} | zip2(as, bs)]
+  defp zip2(_, _), do: []
 
   defp error_flushed(s, %{mode: :transaction} = status, err, buffer) do
     with :ok <- msg_send(s, [msg_sync()], buffer) do
@@ -3236,9 +3249,22 @@ defmodule Postgrex.Protocol do
   end
 
   defp columns(fields) do
-    fields
-    |> Enum.map(fn row_field(type_oid: oid, type_mod: mod, name: name) -> {oid, name, mod} end)
-    |> :lists.unzip3()
+    # Avoid :lists.unzip3/1 — missing on AtomVM; unresolved MFA makes this
+    # function appear as undef at call sites.
+    unzip3_row_fields(fields, [], [], [])
+  end
+
+  defp unzip3_row_fields([], oids, names, mods) do
+    {:lists.reverse(oids), :lists.reverse(names), :lists.reverse(mods)}
+  end
+
+  defp unzip3_row_fields(
+         [row_field(type_oid: oid, type_mod: mod, name: name) | rest],
+         oids,
+         names,
+         mods
+       ) do
+    unzip3_row_fields(rest, [oid | oids], [name | names], [mod | mods])
   end
 
   defp column_names(fields) do
@@ -3295,6 +3321,22 @@ defmodule Postgrex.Protocol do
 
   # It is ok to use infinity timeout here if in client process as timer is
   # running.
+  defp msg_recv(%{sock: {Postgrex.Socket, sock}} = s, timeout, :active_once) do
+    receive do
+      {:tcp, ^sock, buffer} ->
+        msg_recv(s, timeout, buffer)
+
+      {:tcp_closed, ^sock} ->
+        disconnect(s, :tcp, "async_recv", :closed, :active_once)
+
+      {:tcp_error, ^sock, reason} ->
+        disconnect(s, :tcp, "async_recv", reason, :active_once)
+    after
+      timeout ->
+        disconnect(s, :tcp, "async_recv", :timeout, :active_once)
+    end
+  end
+
   defp msg_recv(%{sock: {:ssl, sock}} = s, timeout, :active_once) do
     receive do
       {:ssl, ^sock, buffer} ->
@@ -3473,7 +3515,13 @@ defmodule Postgrex.Protocol do
   end
 
   defp conn_error(:ssl, action, reason) do
-    formatted_reason = :ssl.format_error(reason)
+    formatted_reason =
+      if function_exported?(:ssl, :format_error, 1) do
+        :ssl.format_error(reason)
+      else
+        inspect(reason)
+      end
+
     conn_error("ssl #{action}: #{formatted_reason} - #{inspect(reason)}")
   end
 
@@ -3543,8 +3591,20 @@ defmodule Postgrex.Protocol do
     {:disconnect, err, s}
   end
 
-  defp recv_buffer(%{sock: {Postgrex.Socket, _sock}} = s) do
-    {:ok, %{s | buffer: <<>>}}
+  defp recv_buffer(%{sock: {Postgrex.Socket, sock}} = s) do
+    receive do
+      {:tcp, ^sock, buffer} ->
+        {:ok, %{s | buffer: buffer}}
+
+      {:tcp_closed, ^sock} ->
+        disconnect(s, :tcp, "async recv", :closed, "")
+
+      {:tcp_error, ^sock, reason} ->
+        disconnect(s, :tcp, "async_recv", reason, "")
+    after
+      0 ->
+        {:ok, %{s | buffer: <<>>}}
+    end
   end
 
   defp recv_buffer(%{sock: {:ssl, sock}} = s) do
@@ -3564,9 +3624,16 @@ defmodule Postgrex.Protocol do
   end
 
   defp sock_peername(Postgrex.Socket, sock), do: Postgrex.Socket.peername(sock)
-  defp sock_peername(:ssl, sock), do: :ssl.peername(sock)
 
-  defp activate(%{sock: {Postgrex.Socket, _}} = s, buffer) when is_binary(buffer) do
+  defp sock_peername(:ssl, sock) do
+    if function_exported?(:ssl, :peername, 1) do
+      :ssl.peername(sock)
+    else
+      {:error, :notsup}
+    end
+  end
+
+  defp activate(%{sock: {Postgrex.Socket, _sock}} = s, buffer) when is_binary(buffer) do
     {:ok, %{s | buffer: buffer}}
   end
 
@@ -3593,8 +3660,15 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  defp setopts(Postgrex.Socket, _sock, _opts), do: :ok
-  defp setopts(:ssl, sock, opts), do: :ssl.setopts(sock, opts)
+  defp setopts(Postgrex.Socket, sock, opts), do: Postgrex.Socket.setopts(sock, opts)
+
+  defp setopts(:ssl, sock, opts) do
+    if function_exported?(:ssl, :setopts, 2) do
+      :ssl.setopts(sock, opts)
+    else
+      :ok
+    end
+  end
 
   defp terminate(%{sock: {mod, sock}}) do
     msg = msg_terminate()

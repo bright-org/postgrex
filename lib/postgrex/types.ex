@@ -42,35 +42,21 @@ defmodule Postgrex.Types do
 
   @doc false
   @spec owner(state) :: {:ok, pid} | :error
-  def owner({_, table}) do
-    case :ets.info(table, :owner) do
-      owner when is_pid(owner) ->
-        {:ok, owner}
-
-      :undefined ->
-        :error
-    end
+  def owner({_, _table}) do
+    # AtomVM has no :ets.info/2.
+    :error
   end
 
   @doc false
   @spec bootstrap_query({pos_integer, non_neg_integer, non_neg_integer}, state) :: binary | nil
-  def bootstrap_query(version, %{types: {_, table}} = s) do
-    case :ets.info(table, :size) do
-      0 ->
-        # avoid loading information about table-types
-        # since there might be a lot them and most likely
-        # they won't be used; subsequent bootstrap will
-        # fetch them along with any other "new" types
-        filter_oids = """
-        WHERE (t.typrelid = 0)
-        AND (t.typelem = 0 OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type s WHERE s.typrelid != 0 AND s.oid = t.typelem))
-        """
+  def bootstrap_query(version, s) do
+    # AtomVM has no :ets.info/2 size; always bootstrap.
+    filter_oids = """
+    WHERE (t.typrelid = 0)
+    AND (t.typelem = 0 OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type s WHERE s.typrelid != 0 AND s.oid = t.typelem))
+    """
 
-        build_bootstrap_query(version, filter_oids, s)
-
-      _ ->
-        nil
-    end
+    build_bootstrap_query(version, filter_oids, s)
   end
 
   defp build_bootstrap_query(version, filter_oids, s) do
@@ -158,7 +144,12 @@ defmodule Postgrex.Types do
   def associate_type_infos(type_infos, {module, table}) do
     _ =
       for %TypeInfo{oid: oid} = type_info <- type_infos do
-        true = :ets.insert_new(table, {oid, type_info, nil})
+        # insert_new returns false on reconnect when the oid already exists.
+        # AtomVM TypeServer may re-associate after a dropped connection.
+        case :ets.insert_new(table, {oid, type_info, nil}) do
+          true -> true
+          false -> :ets.insert(table, {oid, type_info, nil})
+        end
       end
 
     _ =
@@ -170,7 +161,13 @@ defmodule Postgrex.Types do
             :ets.delete(table, oid)
 
           info ->
-            true = :ets.update_element(table, oid, {3, info})
+            case :ets.update_element(table, oid, {3, info}) do
+              true ->
+                true
+
+              false ->
+                :ets.insert(table, {oid, type_info, info})
+            end
         end
       end
 

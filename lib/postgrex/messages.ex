@@ -132,9 +132,10 @@ defmodule Postgrex.Messages do
   end
 
   # parameter_desc
-  def parse(<<len::uint16(), rest::binary(len, 32)>>, ?t, _size) do
-    oids = for <<oid::size(32) <- rest>>, do: oid
-    msg_parameter_desc(type_oids: oids)
+  # Avoid binary-size/unit(32) and binary comprehensions — AtomVM only
+  # supports bs_get_binary with unit 8.
+  def parse(<<len::uint16(), rest::binary>>, ?t, _size) when byte_size(rest) == len * 4 do
+    msg_parameter_desc(type_oids: decode_uint32_list(rest, []))
   end
 
   def parse(<<overflow_len::uint16(), _::binary>>, ?t, size) do
@@ -295,7 +296,7 @@ defmodule Postgrex.Messages do
 
   # parse
   defp encode(msg_parse(name: name, statement: statement, type_oids: oids)) do
-    oids = for oid <- oids, into: "", do: <<oid::uint32()>>
+    oids = encode_uint32_list(oids)
     len = <<div(byte_size(oids), 4)::int16()>>
     {?P, [name, 0, statement, 0, len, oids]}
   end
@@ -337,8 +338,8 @@ defmodule Postgrex.Messages do
            result_formats: result_formats
          )
        ) do
-    pfs = for format <- param_formats, into: "", do: <<format(format)::int16()>>
-    rfs = for format <- result_formats, into: "", do: <<format(format)::int16()>>
+    pfs = encode_int16_list(Enum.map(param_formats, &format/1))
+    rfs = encode_int16_list(Enum.map(result_formats, &format/1))
 
     len_pfs = <<div(byte_size(pfs), 2)::int16()>>
     len_rfs = <<div(byte_size(rfs), 2)::int16()>>
@@ -448,9 +449,38 @@ defmodule Postgrex.Messages do
   defp decode_format(0), do: :text
   defp decode_format(1), do: :binary
 
-  defp decode_copy(<<format::int8(), len::uint16(), rest::binary(len, 16)>>) do
+  defp decode_copy(<<format::int8(), len::uint16(), rest::binary>>)
+       when byte_size(rest) == len * 2 do
     format = decode_format(format)
-    columns = for <<column::uint16() <- rest>>, do: decode_format(column)
+    columns = decode_uint16_formats(rest, [])
     {format, columns}
+  end
+
+  defp decode_uint32_list(<<>>, acc), do: :lists.reverse(acc)
+
+  defp decode_uint32_list(<<oid::unsigned-32, rest::binary>>, acc) do
+    decode_uint32_list(rest, [oid | acc])
+  end
+
+  defp decode_uint16_formats(<<>>, acc), do: :lists.reverse(acc)
+
+  defp decode_uint16_formats(<<column::uint16(), rest::binary>>, acc) do
+    decode_uint16_formats(rest, [decode_format(column) | acc])
+  end
+
+  defp encode_uint32_list(oids), do: encode_uint32_list(oids, [])
+
+  defp encode_uint32_list([], acc), do: :erlang.iolist_to_binary(:lists.reverse(acc))
+
+  defp encode_uint32_list([oid | rest], acc) do
+    encode_uint32_list(rest, [<<oid::uint32()>> | acc])
+  end
+
+  defp encode_int16_list(ints), do: encode_int16_list(ints, [])
+
+  defp encode_int16_list([], acc), do: :erlang.iolist_to_binary(:lists.reverse(acc))
+
+  defp encode_int16_list([int | rest], acc) do
+    encode_int16_list(rest, [<<int::int16()>> | acc])
   end
 end
