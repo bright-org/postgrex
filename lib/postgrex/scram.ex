@@ -55,33 +55,46 @@ defmodule Postgrex.SCRAM do
     [mechanism, 0, size, sasl_data]
   end
 
-  def client_final(data, {_mechanism, gs2_header, cbind_data}, opts) do
-    # Extract data from server-first message
+  # AtomVM has failed to resolve client_final/3 specifically; keep a thin alias.
+  def client_final(data, cb, opts), do: finish_client(data, cb, opts)
+
+  def finish_client(data, {_mechanism, gs2_header, cbind_data}, opts) do
     server = parse_server_data(data)
-    {:ok, server_s} = Base.decode64(server[?s])
-    server_i = String.to_integer(server[?i])
-
-    # Create and cache client and server keys if they don't already exist
+    server_r = Map.get(server, ?r)
+    server_s_b64 = Map.get(server, ?s)
+    server_i_bin = Map.get(server, ?i)
+    {:ok, server_s} = Base.decode64(server_s_b64)
+    server_i = :erlang.binary_to_integer(server_i_bin)
     pass = Keyword.fetch!(opts, :password)
-    cache_key = create_cache_key(pass, server_s, server_i)
+    {client_key, server_key} = calculate_client_server_keys(pass, server_s, server_i)
+    cbind_input = Base.encode64(:erlang.iolist_to_binary([gs2_header, cbind_data]))
+    message_without_proof = ["c=", cbind_input, ",r=", server_r]
+    client_nonce = :erlang.binary_part(server_r, 0, @nonce_length)
 
-    {client_key, _server_key} =
-      SCRAM.LockedCache.run(cache_key, fn ->
-        calculate_client_server_keys(pass, server_s, server_i)
-      end)
+    message = [
+      "n=,r=",
+      client_nonce,
+      ",r=",
+      server_r,
+      ",s=",
+      server_s_b64,
+      ",i=",
+      server_i_bin,
+      ?,
+    ]
 
-    # Construct client signature and proof
-    cbind_input = Base.encode64(IO.iodata_to_binary([gs2_header, cbind_data]))
-    message_without_proof = ["c=", cbind_input, ",r=", server[?r]]
-    client_nonce = binary_part(server[?r], 0, @nonce_length)
-    message = ["n=,r=", client_nonce, ",r=", server[?r], ",s=", server[?s], ",i=", server[?i], ?,]
-    auth_message = IO.iodata_to_binary([message | message_without_proof])
+    auth_message = :erlang.iolist_to_binary([message | message_without_proof])
+    hashed = :crypto.hash(:sha256, client_key)
+    client_sig = hmac(:sha256, hashed, auth_message)
+    # AtomVM crypto has no exor/2 — XOR client_key with client_sig ourselves.
+    proof = Base.encode64(binary_xor(client_key, client_sig))
 
-    client_sig = hmac(:sha256, :crypto.hash(:sha256, client_key), auth_message)
-    proof = Base.encode64(:crypto.exor(client_key, client_sig))
-
-    # Store data needed to verify the server signature
-    scram_state = %{salt: server_s, iterations: server_i, auth_message: auth_message}
+    scram_state = %{
+      salt: server_s,
+      iterations: server_i,
+      auth_message: auth_message,
+      server_key: server_key
+    }
 
     {[message_without_proof, ",p=", proof], scram_state}
   end
@@ -116,77 +129,105 @@ defmodule Postgrex.SCRAM do
     _ -> {:none, :unknown}
   end
 
-  defp do_verify_server(%{?e => server_e}, _scram_state, _opts) do
-    msg = "error received in SCRAM server final message: #{inspect(server_e)}"
-    {:error, %Postgrex.Error{message: msg}}
-  end
+  def do_verify_server(server, scram_state, opts) do
+    cond do
+      Map.has_key?(server, ?e) ->
+        server_e = Map.get(server, ?e)
+        msg = "error received in SCRAM server final message: #{inspect(server_e)}"
+        {:error, %Postgrex.Error{message: msg}}
 
-  defp do_verify_server(%{?v => server_v}, scram_state, opts) do
-    # Decode server signature from the server-final message
-    {:ok, server_sig} = Base.decode64(server_v)
+      Map.has_key?(server, ?v) ->
+        server_v = Map.get(server, ?v)
+        {:ok, server_sig} = Base.decode64(server_v)
 
-    # Construct expected server signature
-    pass = Keyword.fetch!(opts, :password)
-    cache_key = create_cache_key(pass, scram_state.salt, scram_state.iterations)
-    {_client_key, server_key} = SCRAM.LockedCache.get(cache_key)
-    expected_server_sig = hmac(:sha256, server_key, scram_state.auth_message)
+        server_key =
+          case Map.get(scram_state, :server_key) do
+            nil ->
+              pass = Keyword.fetch!(opts, :password)
+              {_client_key, key} =
+                calculate_client_server_keys(pass, Map.get(scram_state, :salt), Map.get(scram_state, :iterations))
 
-    # Verify the server signature sent to us is correct
-    if expected_server_sig == server_sig do
-      :ok
-    else
-      msg = "cannot verify SCRAM server signature"
-      {:error, %Postgrex.Error{message: msg}}
+              key
+
+            key ->
+              key
+          end
+
+        expected_server_sig = hmac(:sha256, server_key, Map.get(scram_state, :auth_message))
+
+        if expected_server_sig == server_sig do
+          :ok
+        else
+          {:error, %Postgrex.Error{message: "cannot verify SCRAM server signature"}}
+        end
+
+      true ->
+        msg = "unsupported SCRAM server final message: #{inspect(server)}"
+        {:error, %Postgrex.Error{message: msg}}
     end
   end
 
-  defp do_verify_server(server, _scram_state, _opts) do
-    msg = "unsupported SCRAM server final message: #{inspect(server)}"
-    {:error, %Postgrex.Error{message: msg}}
+  # Avoid `for`/`into` (FunT) — AtomVM has failed to resolve client_final when funs are present.
+  def parse_server_data(data) do
+    parts = :binary.split(data, ",", [:global])
+    parse_server_parts(parts, %{})
   end
 
-  defp parse_server_data(data) do
-    for kv <- :binary.split(data, ",", [:global]), into: %{} do
-      <<k, "=", v::binary>> = kv
-      {k, v}
-    end
+  def parse_server_parts([], acc), do: acc
+
+  def parse_server_parts([kv | rest], acc) do
+    <<k, "=", v::binary>> = kv
+    parse_server_parts(rest, Map.put(acc, k, v))
   end
 
   defp create_cache_key(pass, salt, iterations) do
     {:crypto.hash(:sha256, pass), salt, iterations}
   end
 
-  defp calculate_client_server_keys(pass, salt, iterations) do
-    salted_pass = hash_password(pass, salt, iterations)
+  # AtomVM can fail to resolve Elixir defp locals (undef). Keep helpers exported.
+  def calculate_client_server_keys(pass, salt, iterations) do
+    # Use PBKDF2 NIF instead of recursive iterate/4 (AtomVM undef on that path).
+    salted_pass = :crypto.pbkdf2_hmac(:sha256, pass, salt, iterations, @hash_length)
     client_key = hmac(:sha256, salted_pass, "Client Key")
     server_key = hmac(:sha256, salted_pass, "Server Key")
 
     {client_key, server_key}
   end
 
-  defp hash_password(secret, salt, iterations) do
+  def hash_password(secret, salt, iterations) do
     hash_password(secret, salt, iterations, 1, [], 0)
   end
 
-  defp hash_password(_secret, _salt, _iterations, _block_index, acc, length)
-       when length >= @hash_length do
+  def hash_password(_secret, _salt, _iterations, _block_index, acc, length)
+      when length >= @hash_length do
     acc
     |> IO.iodata_to_binary()
     |> binary_part(0, @hash_length)
   end
 
-  defp hash_password(secret, salt, iterations, block_index, acc, length) do
+  def hash_password(secret, salt, iterations, block_index, acc, length) do
     initial = hmac(:sha256, secret, <<salt::binary, block_index::integer-size(32)>>)
     block = iterate(secret, iterations - 1, initial, initial)
     length = byte_size(block) + length
     hash_password(secret, salt, iterations, block_index + 1, [acc | block], length)
   end
 
-  defp iterate(_secret, 0, _prev, acc), do: acc
+  def iterate(_secret, 0, _prev, acc), do: acc
 
-  defp iterate(secret, iteration, prev, acc) do
+  def iterate(secret, iteration, prev, acc) do
     next = hmac(:sha256, secret, prev)
-    iterate(secret, iteration - 1, next, :crypto.exor(next, acc))
+    iterate(secret, iteration - 1, next, binary_xor(next, acc))
+  end
+
+  # AtomVM does not export :crypto.exor/2.
+  def binary_xor(a, b) when byte_size(a) == byte_size(b) do
+    binary_xor(a, b, <<>>)
+  end
+
+  def binary_xor(<<>>, <<>>, acc), do: acc
+
+  def binary_xor(<<x, a::binary>>, <<y, b::binary>>, acc) do
+    binary_xor(a, b, <<acc::binary, :erlang.bxor(x, y)>>)
   end
 
   # :crypto.mac/4 was added in OTP-22.1, and :crypto.hmac/3 removed in OTP-24.
@@ -194,8 +235,8 @@ defmodule Postgrex.SCRAM do
   # to the code server on every call. The downside is this module won't work
   # if it's compiled on OTP-22.0 or older then executed on OTP-24 or newer.
   if Code.ensure_loaded?(:crypto) and function_exported?(:crypto, :mac, 4) do
-    defp hmac(type, key, data), do: :crypto.mac(:hmac, type, key, data)
+    def hmac(type, key, data), do: :crypto.mac(:hmac, type, key, data)
   else
-    defp hmac(type, key, data), do: :crypto.hmac(type, key, data)
+    def hmac(type, key, data), do: :crypto.hmac(type, key, data)
   end
 end
